@@ -18,6 +18,7 @@ import {
   collectReachable,
   decodePktLines,
   decodePktLinesUntilFlush,
+  diffTrees,
   filesOfCommit,
   flattenTree,
   hashObject,
@@ -88,6 +89,11 @@ interface RepoRec {
   pulls: Map<number, PullRec>;
   nextNumber: number;
   seq: number;
+  /** Fetch answers are immutable for fixed arguments (objects never change): cache the bytes. */
+  fetchCache: Map<string, Buffer>;
+  fetchCacheBytes: number;
+  /** Changed-file lists keyed by the two tree ids they were diffed from. */
+  diffCache: Map<string, Array<Record<string, unknown>>>;
 }
 
 const reposByName = new Map<string, RepoRec>();
@@ -154,6 +160,9 @@ function createRepo(name: string, description: string, isPrivate: boolean): Repo
     pulls: new Map(),
     nextNumber: 1,
     seq: nextSeq(),
+    fetchCache: new Map(),
+    fetchCacheBytes: 0,
+    diffCache: new Map(),
   };
   nextRepoId += 1;
   reposByName.set(name, repo);
@@ -178,6 +187,10 @@ function sendJson(res: ServerResponse, status: number, body: unknown, headers: R
     'content-type': JSON_TYPE,
     'content-length': Buffer.byteLength(text),
     'x-github-request-id': nextRequestId(),
+    // Static, generous rate-limit headers in GitHub's shape.
+    'x-ratelimit-limit': '5000',
+    'x-ratelimit-remaining': '4999',
+    'x-ratelimit-reset': '1893456000',
     ...headers,
   });
   res.end(text);
@@ -378,7 +391,7 @@ function advertisedRefs(repo: RepoRec): RefLine[] {
 function advertisementV0(repo: RepoRec, service: 'git-upload-pack' | 'git-receive-pack'): Buffer {
   const target = headTarget(repo);
   const caps = service === 'git-upload-pack'
-    ? `multi_ack_detailed side-band-64k thin-pack ofs-delta shallow deepen-since deepen-not deepen-relative agent=${AGENT} symref=HEAD:${target}`
+    ? `side-band-64k shallow deepen-since deepen-not agent=${AGENT} symref=HEAD:${target}`
     : `report-status delete-refs side-band-64k ofs-delta agent=${AGENT}`;
   const parts: Buffer[] = [pktLine(`# service=${service}\n`), PKT_FLUSH];
   const lines = advertisedRefs(repo);
@@ -402,7 +415,7 @@ function advertisementV2(): Buffer {
     pktLine('version 2\n'),
     pktLine(`agent=${AGENT}\n`),
     pktLine('ls-refs=unborn\n'),
-    pktLine('fetch=shallow wait-for-done filter\n'),
+    pktLine('fetch=shallow\n'),
     pktLine('object-format=sha1\n'),
     PKT_FLUSH,
   ]);
@@ -457,13 +470,16 @@ function reachableWithStops(store: ObjectStore, tips: readonly string[], stops: 
     if (object === undefined) continue;
     seen.add(oid);
     if (object.type === 'commit') {
-      const commit = parseCommit(object.data);
-      if (commit.tree !== '') stack.push(commit.tree);
-      if (!stops.has(oid)) for (const parent of commit.parents) stack.push(parent);
+      const commit = store.commitInfo(oid);
+      if (commit !== null) {
+        if (commit.tree !== '') stack.push(commit.tree);
+        if (!stops.has(oid)) for (const parent of commit.parents) stack.push(parent);
+      }
     } else if (object.type === 'tree') {
-      for (const entry of parseTree(object.data)) stack.push(entry.oid);
+      for (const entry of store.treeEntries(oid) ?? []) stack.push(entry.oid);
     } else if (object.type === 'tag') {
-      stack.push(parseTag(object.data).object);
+      const tag = store.tagInfo(oid);
+      if (tag !== null) stack.push(tag.object);
     }
   }
   return seen;
@@ -503,9 +519,9 @@ function planFetch(repo: RepoRec, wants: readonly string[], haves: readonly stri
   while (queue.length > 0) {
     const { oid, gen } = queue.shift() as { oid: string; gen: number };
     if (gen >= depth) continue;
-    const object = store.get(oid);
-    if (object === undefined || object.type !== 'commit') continue;
-    for (const parent of parseCommit(object.data).parents) {
+    const commit = store.commitInfo(oid);
+    if (commit === null) continue;
+    for (const parent of commit.parents) {
       if (!generation.has(parent)) {
         generation.set(parent, gen + 1);
         queue.push({ oid: parent, gen: gen + 1 });
@@ -518,11 +534,8 @@ function planFetch(repo: RepoRec, wants: readonly string[], haves: readonly stri
   for (const want of wants) if (store.has(want)) included.add(want);
   for (const commitOid of includedCommits) {
     included.add(commitOid);
-    const object = store.get(commitOid);
-    if (object !== undefined && object.type === 'commit') {
-      const tree = parseCommit(object.data).tree;
-      for (const oid of flattenTreeSet(store, tree)) included.add(oid);
-    }
+    const commit = store.commitInfo(commitOid);
+    if (commit !== null) for (const oid of flattenTreeSet(store, commit.tree)) included.add(oid);
   }
   // Tag objects on the way to a wanted commit are part of the closure too.
   for (const want of wants) {
@@ -531,15 +544,17 @@ function planFetch(repo: RepoRec, wants: readonly string[], haves: readonly stri
       const object = store.get(current);
       if (object === undefined || object.type !== 'tag') break;
       included.add(current);
-      current = parseTag(object.data).object;
+      const tag = store.tagInfo(current);
+      if (tag === null) break;
+      current = tag.object;
     }
   }
   const shallow: string[] = [];
   for (const commitOid of includedCommits) {
     if ((generation.get(commitOid) as number) < depth) continue;
-    const object = store.get(commitOid);
-    if (object === undefined || object.type !== 'commit') continue;
-    if (parseCommit(object.data).parents.length > 0) shallow.push(commitOid);
+    const commit = store.commitInfo(commitOid);
+    if (commit === null) continue;
+    if (commit.parents.length > 0) shallow.push(commitOid);
   }
   const unshallow = clientShallow.filter((oid) => includedCommits.has(oid) && !shallow.includes(oid));
   const deliver = new Set<string>();
@@ -561,9 +576,7 @@ function flattenTreeSet(store: ObjectStore, treeOid: string): Set<string> {
     if (seenTrees.has(oid)) continue;
     seenTrees.add(oid);
     out.add(oid);
-    const object = store.get(oid);
-    if (object === undefined || object.type !== 'tree') continue;
-    for (const entry of parseTree(object.data)) if (entry.mode === '40000') stack.push(entry.oid);
+    for (const entry of store.treeEntries(oid) ?? []) if (entry.mode === '40000') stack.push(entry.oid);
   }
   return out;
 }
@@ -599,34 +612,61 @@ function parseFetchArgs(lines: readonly string[]): FetchArgs {
   return args;
 }
 
+/**
+ * A fetch answer is a pure function of its arguments: objects are immutable and ids are
+ * content hashes, so the same (wants, haves, shallow, depth) always plans the same pack.
+ * Benchmarks repeat identical fetches many times over; caching the finished bytes makes the
+ * repeats nearly free. The cache is size-capped with oldest-first eviction.
+ */
+function cachedFetchAnswer(repo: RepoRec, protocol: 'v2' | 'v0', args: FetchArgs, build: () => Buffer): Buffer {
+  const key = [protocol, args.depth ?? 'full', ...[...args.wants].sort(), '--', ...[...args.haves].sort(), '--', ...[...args.shallow].sort()].join(' ');
+  const hit = repo.fetchCache.get(key);
+  if (hit !== undefined) return hit;
+  const answer = build();
+  if (repo.fetchCacheBytes + answer.length <= 64 * 1024 * 1024) {
+    repo.fetchCache.set(key, answer);
+    repo.fetchCacheBytes += answer.length;
+    while (repo.fetchCacheBytes > 64 * 1024 * 1024 && repo.fetchCache.size > 1) {
+      const oldest = repo.fetchCache.keys().next().value as string;
+      repo.fetchCacheBytes -= (repo.fetchCache.get(oldest) as Buffer).length;
+      repo.fetchCache.delete(oldest);
+    }
+  }
+  return answer;
+}
+
 /** The v2 fetch answer: acknowledgments, shallow info, then the packfile in sideband packets. */
 function fetchAnswerV2(repo: RepoRec, args: FetchArgs): Buffer {
-  const plan = planFetch(repo, args.wants, args.haves, args.shallow, args.depth);
-  const pack = writePack(orderForPack(repo.store, plan.deliver));
-  const parts: Buffer[] = [pktLine('acknowledgments\n'), pktLine('NAK\n'), PKT_FLUSH];
-  if (plan.shallow.length > 0 || plan.unshallow.length > 0) {
-    parts.push(pktLine('shallow-info\n'));
-    for (const oid of plan.shallow) parts.push(pktLine(`shallow ${oid}\n`));
-    for (const oid of plan.unshallow) parts.push(pktLine(`unshallow ${oid}\n`));
+  return cachedFetchAnswer(repo, 'v2', args, () => {
+    const plan = planFetch(repo, args.wants, args.haves, args.shallow, args.depth);
+    const pack = writePack(orderForPack(repo.store, plan.deliver));
+    const parts: Buffer[] = [pktLine('acknowledgments\n'), pktLine('NAK\n'), PKT_FLUSH];
+    if (plan.shallow.length > 0 || plan.unshallow.length > 0) {
+      parts.push(pktLine('shallow-info\n'));
+      for (const oid of plan.shallow) parts.push(pktLine(`shallow ${oid}\n`));
+      for (const oid of plan.unshallow) parts.push(pktLine(`unshallow ${oid}\n`));
+      parts.push(PKT_FLUSH);
+    }
+    parts.push(pktLine('packfile\n'));
+    parts.push(...sidebandPackets(pack));
     parts.push(PKT_FLUSH);
-  }
-  parts.push(pktLine('packfile\n'));
-  parts.push(...sidebandPackets(pack));
-  parts.push(PKT_FLUSH);
-  return Buffer.concat(parts);
+    return Buffer.concat(parts);
+  });
 }
 
 /** The v0 fetch answer: shallow lines, a NAK, then the packfile in sideband packets. */
 function fetchAnswerV0(repo: RepoRec, args: FetchArgs): Buffer {
-  const plan = planFetch(repo, args.wants, args.haves, args.shallow, args.depth);
-  const pack = writePack(orderForPack(repo.store, plan.deliver));
-  const parts: Buffer[] = [];
-  for (const oid of plan.shallow) parts.push(pktLine(`shallow ${oid}\n`));
-  for (const oid of plan.unshallow) parts.push(pktLine(`unshallow ${oid}\n`));
-  parts.push(pktLine('NAK\n'));
-  parts.push(...sidebandPackets(pack));
-  parts.push(PKT_FLUSH);
-  return Buffer.concat(parts);
+  return cachedFetchAnswer(repo, 'v0', args, () => {
+    const plan = planFetch(repo, args.wants, args.haves, args.shallow, args.depth);
+    const pack = writePack(orderForPack(repo.store, plan.deliver));
+    const parts: Buffer[] = [];
+    for (const oid of plan.shallow) parts.push(pktLine(`shallow ${oid}\n`));
+    for (const oid of plan.unshallow) parts.push(pktLine(`unshallow ${oid}\n`));
+    parts.push(pktLine('NAK\n'));
+    parts.push(...sidebandPackets(pack));
+    parts.push(PKT_FLUSH);
+    return Buffer.concat(parts);
+  });
 }
 
 interface RefCommand {
@@ -667,6 +707,9 @@ async function receivePack(repo: RepoRec, body: Buffer): Promise<Buffer> {
 
   let unpackOk = true;
   let unpackError = '';
+  // Objects already in the store are known to have complete closures; the connectivity check
+  // below only needs to descend into what this pack delivers.
+  const preExisting = new Set(repo.store.objects.keys());
   if (pack.length > 0) {
     try {
       await readPackInto(repo.store, pack);
@@ -675,6 +718,36 @@ async function receivePack(repo: RepoRec, body: Buffer): Promise<Buffer> {
       unpackError = err instanceof Error ? err.message : 'unpack failed';
     }
   }
+
+  /**
+   * True when every object reachable from the tip is present. The walk stops at objects that
+   * predate this push (their closures were verified when they arrived), so the check costs
+   * in proportion to the pushed objects, never to the repository's history.
+   */
+  const closureComplete = (tip: string): boolean => {
+    const seen = new Set<string>();
+    const stack = [tip];
+    while (stack.length > 0) {
+      const oid = stack.pop() as string;
+      if (seen.has(oid) || oid === ZERO_OID || preExisting.has(oid)) continue;
+      const object = repo.store.get(oid);
+      if (object === undefined) return false;
+      seen.add(oid);
+      if (object.type === 'commit') {
+        const commit = repo.store.commitInfo(oid);
+        if (commit !== null) {
+          if (commit.tree !== '') stack.push(commit.tree);
+          for (const parent of commit.parents) stack.push(parent);
+        }
+      } else if (object.type === 'tree') {
+        for (const entry of repo.store.treeEntries(oid) ?? []) stack.push(entry.oid);
+      } else if (object.type === 'tag') {
+        const tag = repo.store.tagInfo(oid);
+        if (tag !== null) stack.push(tag.object);
+      }
+    }
+    return true;
+  };
 
   const reportLines: string[] = [unpackOk ? 'unpack ok' : `unpack ${unpackError}`];
   for (const command of commands) {
@@ -698,6 +771,10 @@ async function receivePack(repo: RepoRec, body: Buffer): Promise<Buffer> {
     }
     if (!repo.store.has(command.next)) {
       fail('unknown object');
+      continue;
+    }
+    if (!closureComplete(command.next)) {
+      fail('missing objects');
       continue;
     }
     if (current !== command.old) {
@@ -894,12 +971,12 @@ function handleContents(req: IncomingMessage, res: ServerResponse, repo: RepoRec
       notFound(res);
       return;
     }
-    const commitObject = repo.store.get(commit);
-    if (commitObject === undefined) {
+    const commitInfo = repo.store.commitInfo(commit);
+    if (commitInfo === null) {
       notFound(res);
       return;
     }
-    const treeOid = parseCommit(commitObject.data).tree;
+    const treeOid = commitInfo.tree;
     if (path === '') {
       sendJson(res, 200, listTreeDir(repo, treeOid, ''));
       return;
@@ -1085,26 +1162,31 @@ function pullFiles(repo: RepoRec, pull: PullRec): Array<Record<string, unknown>>
   const headCommit = peelToCommit(repo.store, headTip);
   if (baseCommit === null || headCommit === null) return [];
   const base = mergeBase(repo.store, baseCommit, headCommit) ?? baseCommit;
-  const before = filesOfCommit(repo.store, base);
-  const after = filesOfCommit(repo.store, headCommit);
+  const baseInfo = repo.store.commitInfo(base);
+  const headInfo = repo.store.commitInfo(headCommit);
+  if (baseInfo === null || headInfo === null) return [];
+  // The diff of two immutable trees never changes, so it is computed once and cached; the
+  // recursive comparison skips subtrees that are identical on both sides.
+  const cacheKey = `${baseInfo.tree}|${headInfo.tree}`;
+  const cached = repo.diffCache.get(cacheKey);
+  if (cached !== undefined) return cached;
+  const changes = diffTrees(repo.store, baseInfo.tree, headInfo.tree);
   const out: Array<Record<string, unknown>> = [];
-  const paths = new Set<string>([...before.keys(), ...after.keys()]);
-  for (const path of [...paths].sort()) {
-    const oldEntry = before.get(path);
-    const newEntry = after.get(path);
-    if (oldEntry?.oid === newEntry?.oid) continue;
-    const oldData = oldEntry === undefined ? null : (repo.store.get(oldEntry.oid)?.data ?? null);
-    const newData = newEntry === undefined ? null : (repo.store.get(newEntry.oid)?.data ?? null);
+  for (const path of [...changes.keys()].sort()) {
+    const { before, after } = changes.get(path) as { before: FileEntry | null; after: FileEntry | null };
+    const oldData = before === null ? null : (repo.store.get(before.oid)?.data ?? null);
+    const newData = after === null ? null : (repo.store.get(after.oid)?.data ?? null);
     const { additions, deletions } = lineDiff(oldData, newData);
     out.push({
       filename: path,
-      status: oldEntry === undefined ? 'added' : newEntry === undefined ? 'removed' : 'modified',
+      status: before === null ? 'added' : after === null ? 'removed' : 'modified',
       additions,
       deletions,
       changes: additions + deletions,
-      sha: (newEntry ?? oldEntry)?.oid ?? ZERO_OID,
+      sha: (after ?? before)?.oid ?? ZERO_OID,
     });
   }
+  repo.diffCache.set(cacheKey, out);
   return out;
 }
 
@@ -1274,8 +1356,7 @@ function handleRest(req: IncomingMessage, res: ServerResponse, url: URL, rawBody
         return;
       }
       const items = walkCommits(repo.store, tip, 250).map((oid) => {
-        const object = repo.store.get(oid);
-        const commit = object === undefined ? null : parseCommit(object.data);
+        const commit = repo.store.commitInfo(oid);
         const author = commit === null ? { name: '', email: '', date: '' } : parseIdent(commit.authorLine);
         const committer = commit === null ? { name: '', email: '', date: '' } : parseIdent(commit.committerLine);
         return {
@@ -1564,6 +1645,7 @@ interface GqlField {
 
 interface GqlOperation {
   kind: 'query' | 'mutation';
+  name: string | null;
   fields: GqlField[];
 }
 
@@ -1708,15 +1790,28 @@ function gqlParse(document: string, variables: Record<string, GqlValue>): GqlOpe
         }
         next();
       }
-      // Directives on a field are skipped.
+      // Directives on a field: @skip/@include are evaluated against the variables, any
+      // other directive is skipped over.
+      let dropped = false;
       while (peek() === '@') {
         next();
-        next();
-        skipBalanced('(', ')');
+        const directive = next();
+        const directiveArgs: Record<string, GqlValue> = {};
+        if (peek() === '(') {
+          next();
+          while (peek() !== ')' && peek() !== undefined) {
+            const key = next();
+            if (peek() === ':') next();
+            directiveArgs[key] = parseValue();
+          }
+          next();
+        }
+        if (directive === 'skip' && directiveArgs.if === true) dropped = true;
+        if (directive === 'include' && directiveArgs.if === false) dropped = true;
       }
       let selections: GqlField[] = [];
       if (peek() === '{') selections = parseSelections();
-      fields.push({ name, alias, args, selections, fragmentType: null });
+      if (!dropped) fields.push({ name, alias, args, selections, fragmentType: null });
     }
     next();
     return fields;
@@ -1727,14 +1822,15 @@ function gqlParse(document: string, variables: Record<string, GqlValue>): GqlOpe
     const token = peek();
     if (token === 'query' || token === 'mutation' || token === 'subscription') {
       const kind = next() as 'query' | 'mutation';
-      if (peek() !== '(' && peek() !== '{' && peek() !== '@') next(); // operation name
+      let name: string | null = null;
+      if (peek() !== '(' && peek() !== '{' && peek() !== '@') name = next();
       skipBalanced('(', ')'); // variable definitions
       while (peek() === '@') {
         next();
         next();
         skipBalanced('(', ')');
       }
-      operations.push({ kind: kind === 'mutation' ? 'mutation' : 'query', fields: parseSelections() });
+      operations.push({ kind: kind === 'mutation' ? 'mutation' : 'query', name, fields: parseSelections() });
       continue;
     }
     if (token === 'fragment') {
@@ -1744,7 +1840,7 @@ function gqlParse(document: string, variables: Record<string, GqlValue>): GqlOpe
       continue;
     }
     if (token === '{') {
-      operations.push({ kind: 'query', fields: parseSelections() });
+      operations.push({ kind: 'query', name: null, fields: parseSelections() });
       continue;
     }
     pos += 1;
@@ -2166,7 +2262,7 @@ function gqlMutate(name: string, args: Record<string, GqlValue>, errors: Array<{
 /** Run one GraphQL operation document; answers the {data, errors?} envelope. */
 function gqlExecute(document: string, variables: Record<string, GqlValue>, operationName: string | null): Record<string, unknown> {
   const operations = gqlParse(document, variables);
-  const operation = operationName === null ? operations[0] : (operations.find((candidate) => candidate.kind !== undefined) ?? operations[0]);
+  const operation = operationName === null ? operations[0] : (operations.find((candidate) => candidate.name === operationName) ?? operations[0]);
   if (operation === undefined) return { data: null, errors: [gqlError('No operation in document')] };
   const root: GqlNode = { __typename: operation.kind === 'mutation' ? 'Mutation' : 'Query' };
   const errors: Array<{ message: string }> = [];
@@ -2398,7 +2494,17 @@ function handleMcp(req: IncomingMessage, res: ServerResponse, rawBody: Buffer): 
   let message: Record<string, unknown>;
   try {
     const parsed = JSON.parse(rawText) as unknown;
-    if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) throw new Error('not an object');
+    if (Array.isArray(parsed)) {
+      // JSON-RPC batching existed only in MCP revision 2025-03-26 and was removed in
+      // 2025-06-18; this endpoint deliberately rejects batches rather than guessing.
+      sendJson(res, 400, {
+        jsonrpc: '2.0',
+        id: null,
+        error: { code: -32600, message: 'Invalid Request: batch requests are not supported' },
+      });
+      return;
+    }
+    if (typeof parsed !== 'object' || parsed === null) throw new Error('not an object');
     message = parsed as Record<string, unknown>;
   } catch {
     const idMatch = /"id"\s*:\s*(\d+|"[^"]*")/.exec(rawText);

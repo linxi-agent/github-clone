@@ -13,6 +13,8 @@ export type GitObjectType = 'commit' | 'tree' | 'blob' | 'tag';
 export interface GitObject {
   type: GitObjectType;
   data: Buffer;
+  /** The object's pack entry (varint header + deflated payload), computed lazily on first serve. */
+  packedEntry?: Buffer;
 }
 
 export const ZERO_OID = '0000000000000000000000000000000000000000';
@@ -26,9 +28,14 @@ export function hashObject(type: GitObjectType, data: Buffer): string {
   return createHash('sha1').update(header).update(data).digest('hex');
 }
 
-/** An in-memory object database: id -> object. */
+/** An in-memory object database: id -> object, with every derived view memoized. */
 export class ObjectStore {
   readonly objects = new Map<string, GitObject>();
+  private readonly commitCache = new Map<string, CommitInfo>();
+  private readonly treeCache = new Map<string, TreeEntry[]>();
+  private readonly tagCache = new Map<string, { object: string; type: string }>();
+  private readonly generationCache = new Map<string, number>();
+  private readonly mergeBaseCache = new Map<string, string | null>();
 
   has(oid: string): boolean {
     return this.objects.has(oid);
@@ -47,6 +54,68 @@ export class ObjectStore {
 
   putWithId(oid: string, type: GitObjectType, data: Buffer): void {
     if (!this.objects.has(oid)) this.objects.set(oid, { type, data });
+  }
+
+  /** The parsed commit for an id, parsed once and memoized (objects never change). */
+  commitInfo(oid: string): CommitInfo | null {
+    const cached = this.commitCache.get(oid);
+    if (cached !== undefined) return cached;
+    const object = this.objects.get(oid);
+    if (object === undefined || object.type !== 'commit') return null;
+    const info = parseCommit(object.data);
+    this.commitCache.set(oid, info);
+    return info;
+  }
+
+  /** The parsed entries of a tree, parsed once and memoized. */
+  treeEntries(oid: string): TreeEntry[] | null {
+    const cached = this.treeCache.get(oid);
+    if (cached !== undefined) return cached;
+    const object = this.objects.get(oid);
+    if (object === undefined || object.type !== 'tree') return null;
+    const entries = parseTree(object.data);
+    this.treeCache.set(oid, entries);
+    return entries;
+  }
+
+  /** The parsed target of a tag, parsed once and memoized. */
+  tagInfo(oid: string): { object: string; type: string } | null {
+    const cached = this.tagCache.get(oid);
+    if (cached !== undefined) return cached;
+    const object = this.objects.get(oid);
+    if (object === undefined || object.type !== 'tag') return null;
+    const info = parseTag(object.data);
+    this.tagCache.set(oid, info);
+    return info;
+  }
+
+  /**
+   * A commit's generation number: the longest path from it to a root (roots are 1), in git's
+   * commit-graph sense. Generations strictly decrease along parent edges, which lets ancestry
+   * walks prune any branch that can no longer reach the target.
+   */
+  generationOf(oid: string): number {
+    const cached = this.generationCache.get(oid);
+    if (cached !== undefined) return cached;
+    const info = this.commitInfo(oid);
+    if (info === null) return 0;
+    let generation = 1;
+    for (const parent of info.parents) generation = Math.max(generation, this.generationOf(parent) + 1);
+    this.generationCache.set(oid, generation);
+    return generation;
+  }
+
+  /** The memoized merge base of a commit pair (the pair is unordered). */
+  mergeBaseMemo(a: string, b: string): { hit: boolean; value: string | null } {
+    const key = a < b ? `${a}|${b}` : `${b}|${a}`;
+    if (this.mergeBaseCache.has(key)) return { hit: true, value: this.mergeBaseCache.get(key) ?? null };
+    return { hit: false, value: null };
+  }
+
+  /** Record a merge-base result computed for a pair. */
+  memoizeMergeBase(a: string, b: string, value: string | null): void {
+    const key = a < b ? `${a}|${b}` : `${b}|${a}`;
+    this.mergeBaseCache.set(key, value);
   }
 }
 
@@ -155,7 +224,9 @@ export function peelToCommit(store: ObjectStore, oid: string): string | null {
     if (object === undefined) return null;
     if (object.type === 'commit') return current;
     if (object.type === 'tag') {
-      current = parseTag(object.data).object;
+      const tag = store.tagInfo(current);
+      if (tag === null) return null;
+      current = tag.object;
       continue;
     }
     return null;
@@ -165,9 +236,8 @@ export function peelToCommit(store: ObjectStore, oid: string): string | null {
 
 /** The commit a tag peels to (one level of peeling for advertisements), or null for non-tags. */
 export function peelOne(store: ObjectStore, oid: string): string | null {
-  const object = store.get(oid);
-  if (object === undefined || object.type !== 'tag') return null;
-  return parseTag(object.data).object;
+  const tag = store.tagInfo(oid);
+  return tag === null ? null : tag.object;
 }
 
 /** Every object reachable from the given tips (commits walk parents, trees walk entries, tags peel). */
@@ -181,13 +251,16 @@ export function collectReachable(store: ObjectStore, tips: Iterable<string>): Se
     if (object === undefined) continue;
     seen.add(oid);
     if (object.type === 'commit') {
-      const commit = parseCommit(object.data);
-      if (commit.tree !== '') stack.push(commit.tree);
-      for (const parent of commit.parents) stack.push(parent);
+      const commit = store.commitInfo(oid);
+      if (commit !== null) {
+        if (commit.tree !== '') stack.push(commit.tree);
+        for (const parent of commit.parents) stack.push(parent);
+      }
     } else if (object.type === 'tree') {
-      for (const entry of parseTree(object.data)) stack.push(entry.oid);
+      for (const entry of store.treeEntries(oid) ?? []) stack.push(entry.oid);
     } else if (object.type === 'tag') {
-      stack.push(parseTag(object.data).object);
+      const tag = store.tagInfo(oid);
+      if (tag !== null) stack.push(tag.object);
     }
   }
   return seen;
@@ -204,18 +277,24 @@ export function walkCommits(store: ObjectStore, tip: string, limit = 1000): stri
   while (queue.length > 0 && order.length < limit) {
     const oid = queue.shift() as string;
     if (seen.has(oid)) continue;
-    const object = store.get(oid);
-    if (object === undefined || object.type !== 'commit') continue;
+    const commit = store.commitInfo(oid);
+    if (commit === null) continue;
     seen.add(oid);
     order.push(oid);
-    for (const parent of parseCommit(object.data).parents) queue.push(parent);
+    for (const parent of commit.parents) queue.push(parent);
   }
   return order;
 }
 
-/** True when `ancestor` is reachable from `descendant` by following commit parents (or equal). */
+/**
+ * True when `ancestor` is reachable from `descendant` by following commit parents (or equal).
+ * Generation numbers prune the walk: a commit whose generation is below the target's can
+ * never reach it, so its whole subtree is skipped.
+ */
 export function isAncestor(store: ObjectStore, ancestor: string, descendant: string): boolean {
   if (ancestor === descendant) return true;
+  const targetGeneration = store.generationOf(ancestor);
+  if (targetGeneration > store.generationOf(descendant)) return false;
   const seen = new Set<string>();
   const stack = [descendant];
   while (stack.length > 0) {
@@ -223,37 +302,45 @@ export function isAncestor(store: ObjectStore, ancestor: string, descendant: str
     if (oid === ancestor) return true;
     if (seen.has(oid)) continue;
     seen.add(oid);
-    const object = store.get(oid);
-    if (object === undefined || object.type !== 'commit') continue;
-    for (const parent of parseCommit(object.data).parents) stack.push(parent);
+    if (store.generationOf(oid) < targetGeneration) continue;
+    const commit = store.commitInfo(oid);
+    if (commit === null) continue;
+    for (const parent of commit.parents) stack.push(parent);
   }
   return false;
 }
 
 /** The best common ancestor of two commits (first shared commit on a breadth walk), or null. */
 export function mergeBase(store: ObjectStore, a: string, b: string): string | null {
+  const memo = store.mergeBaseMemo(a, b);
+  if (memo.hit) return memo.value;
   const ancestorsOfA = new Set<string>();
   const stackA = [a];
   while (stackA.length > 0) {
     const oid = stackA.pop() as string;
     if (ancestorsOfA.has(oid)) continue;
-    const object = store.get(oid);
-    if (object === undefined || object.type !== 'commit') continue;
+    const commit = store.commitInfo(oid);
+    if (commit === null) continue;
     ancestorsOfA.add(oid);
-    for (const parent of parseCommit(object.data).parents) stackA.push(parent);
+    for (const parent of commit.parents) stackA.push(parent);
   }
   const seen = new Set<string>();
   const queue = [b];
+  let result: string | null = null;
   while (queue.length > 0) {
     const oid = queue.shift() as string;
     if (seen.has(oid)) continue;
     seen.add(oid);
-    if (ancestorsOfA.has(oid)) return oid;
-    const object = store.get(oid);
-    if (object === undefined || object.type !== 'commit') continue;
-    for (const parent of parseCommit(object.data).parents) queue.push(parent);
+    if (ancestorsOfA.has(oid)) {
+      result = oid;
+      break;
+    }
+    const commit = store.commitInfo(oid);
+    if (commit === null) continue;
+    for (const parent of commit.parents) queue.push(parent);
   }
-  return null;
+  store.memoizeMergeBase(a, b, result);
+  return result;
 }
 
 // --------------------------------------------------------------------------- tree <-> file map
@@ -265,14 +352,53 @@ export interface FileEntry {
 
 /** Flatten a tree (recursively) into a map of slash paths to blob entries. */
 export function flattenTree(store: ObjectStore, treeOid: string, prefix = '', out = new Map<string, FileEntry>()): Map<string, FileEntry> {
-  const object = store.get(treeOid);
-  if (object === undefined || object.type !== 'tree') return out;
-  for (const entry of parseTree(object.data)) {
+  const entries = store.treeEntries(treeOid);
+  if (entries === null) return out;
+  for (const entry of entries) {
     const path = prefix === '' ? entry.name : `${prefix}/${entry.name}`;
     if (entry.mode === '40000') flattenTree(store, entry.oid, path, out);
     else out.set(path, { mode: entry.mode, oid: entry.oid });
   }
   return out;
+}
+
+/**
+ * The changed paths between two trees, compared recursively: any subtree whose id is the
+ * same on both sides is skipped whole, so the cost tracks the number of changed paths,
+ * not the size of the trees.
+ */
+export function diffTrees(store: ObjectStore, baseTree: string, headTree: string): Map<string, { before: FileEntry | null; after: FileEntry | null }> {
+  const changes = new Map<string, { before: FileEntry | null; after: FileEntry | null }>();
+  const walk = (baseOid: string | null, headOid: string | null, prefix: string): void => {
+    if (baseOid === headOid) return;
+    const baseEntries = baseOid === null ? [] : (store.treeEntries(baseOid) ?? []);
+    const headEntries = headOid === null ? [] : (store.treeEntries(headOid) ?? []);
+    const baseByName = new Map(baseEntries.map((entry) => [entry.name, entry]));
+    const headByName = new Map(headEntries.map((entry) => [entry.name, entry]));
+    const names = new Set([...baseByName.keys(), ...headByName.keys()]);
+    for (const name of names) {
+      const before = baseByName.get(name);
+      const after = headByName.get(name);
+      const path = prefix === '' ? name : `${prefix}/${name}`;
+      if (before?.oid === after?.oid) continue;
+      const beforeIsDir = before?.mode === '40000';
+      const afterIsDir = after?.mode === '40000';
+      if (beforeIsDir || afterIsDir) {
+        // A path that flips between file and directory reports the file side as a change
+        // in its own right, alongside whatever the directory side contains.
+        if (before !== undefined && !beforeIsDir) changes.set(path, { before: { mode: before.mode, oid: before.oid }, after: null });
+        if (after !== undefined && !afterIsDir) changes.set(path, { before: null, after: { mode: after.mode, oid: after.oid } });
+        walk(beforeIsDir ? (before as TreeEntry).oid : null, afterIsDir ? (after as TreeEntry).oid : null, path);
+        continue;
+      }
+      changes.set(path, {
+        before: before === undefined ? null : { mode: before.mode, oid: before.oid },
+        after: after === undefined ? null : { mode: after.mode, oid: after.oid },
+      });
+    }
+  };
+  walk(baseTree, headTree, '');
+  return changes;
 }
 
 /** The files of a commit: flatten its tree. */
@@ -338,10 +464,13 @@ export function writePack(objects: readonly GitObject[]): Buffer {
   header.writeUInt32BE(objects.length, 8);
   parts.push(header);
   for (const object of objects) {
-    parts.push(packObjectHeader(object.type, object.data.length));
-    // Level 1: pack writing sits on the clone/fetch hot path, and a slightly larger pack is
-    // cheaper than the CPU the higher levels spend squeezing it.
-    parts.push(deflateSync(object.data, { level: 1 }));
+    // An object's pack entry is deflated the first time a pack needs it and kept on the
+    // object afterwards: ingestion (the push path) pays no compression at all, the first
+    // fetch pays it once, and every later pack is pure assembly.
+    if (object.packedEntry === undefined) {
+      object.packedEntry = Buffer.concat([packObjectHeader(object.type, object.data.length), deflateSync(object.data, { level: 1 })]);
+    }
+    parts.push(object.packedEntry);
   }
   const body = Buffer.concat(parts);
   const trailer = createHash('sha1').update(body).digest();
